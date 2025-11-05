@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# bybit_pattern_scanner_hourly_berlin.py
+# bybit_pattern_scanner_hourly_berlin.py  → теперь под Binance Futures (USDⓢ-M)
 # Python 3.10+
 # pip install -r requirements.txt
+#
 # Поведение:
 # - При первом запуске: стартовый опрос ПОСЛЕДНИХ ЗАКРЫТЫХ свечей (1H/4H/1D).
 # - Далее: раз в ЧАС на начале часа (в обычном режиме).
@@ -12,6 +13,12 @@
 #   3) Если нет — пишем "нет паттернов: [ожидаемые]".
 # - Сигналы пишутся в signals_log.csv ТОЛЬКО если эта свеча ещё не логировалась.
 # - Вывод отсортирован: символы по алфавиту, TF — 1H, 4H, 1D.
+#
+# Требуемые пакеты:
+#   pandas==2.2.3
+#   numpy==1.26.4
+#   pytz==2024.1
+#   requests==2.32.3
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -22,21 +29,26 @@ import time
 
 import numpy as np
 import pandas as pd
-from pybit.unified_trading import HTTP
-from requests.exceptions import RequestException  # оставлено на случай расширений
 import pytz
+import requests
 
 # -------------------------
 # Конфигурация
 # -------------------------
 
-CATEGORY = "linear"
+# Биржа: Binance Futures USDⓢ-M (публичные свечи, без ключей)
+BINANCE_FAPI_BASE = "https://fapi.binance.com"
+
+# Список символов (Futures USDⓢ-M). POLUSDT — актуальное имя MATIC на Binance.
 SYMBOLS = [
     "ADAUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
     "ETHUSDT", "LTCUSDT", "POLUSDT", "SOLUSDT", "XRPUSDT"
 ]  # алфавит
 
-TF_MAP = {"1H": "60", "4H": "240", "1D": "D"}
+# TF-карты: логика сканера в "1H/4H/1D", у Binance — "1h/4h/1d"
+TF_MAP = {"1H": "1h", "4H": "4h", "1D": "1d"}
+# Для внутренней проверки закрытости свечи
+TF_DELTA = {"1H": timedelta(hours=1), "4H": timedelta(hours=4), "1D": timedelta(days=1)}
 TF_SORT = ["1H", "4H", "1D"]
 
 # Стратегии по согласованным правилам
@@ -83,8 +95,9 @@ AVOID_UTC_HOURS = {("LTCUSDT", "1H"): set(range(0, 6))}
 LOG_FILE = "signals_log.csv"
 STATE_FILE = "last_processed.json"
 
-# Пул потоков
-MAX_WORKERS = min(16, len(SYMBOLS) * 3)
+# Пул потоков и щадящий темп (можно править через ENV в Actions)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # на Binance можно чуть больше параллельности
+RATE_DELAY_SEC = float(os.getenv("RATE_DELAY_SEC", "0.1"))
 
 # Временные зоны
 BERLIN = pytz.timezone("Europe/Berlin")
@@ -105,13 +118,7 @@ def fmt_berlin(dt_utc: datetime) -> str:
     return to_berlin(dt_utc).strftime("%Y-%m-%d %H:%M %Z")
 
 def tf_timedelta(tf: str) -> timedelta:
-    if tf == "1H":
-        return timedelta(hours=1)
-    if tf == "4H":
-        return timedelta(hours=4)
-    if tf == "1D":
-        return timedelta(days=1)
-    return timedelta(minutes=1)
+    return TF_DELTA.get(tf, timedelta(minutes=1))
 
 def sleep_until_next_top_of_hour():
     now = datetime.now()
@@ -125,41 +132,28 @@ def sleep_until_next_top_of_hour():
 # -------------------------
 
 def to_df(klines) -> pd.DataFrame:
+    """
+    Поддержка формата Binance /fapi/v1/klines:
+      [ openTime, open, high, low, close, volume, closeTime,
+        quoteAssetVolume, numberOfTrades, takerBuyBase, takerBuyQuote, ignore ]
+    Мы приводим к колонкам: start, open, high, low, close, volume, turnover
+    """
     if not klines:
         return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume", "turnover"])
-    first = klines[0]
-    if isinstance(first, dict) and {"open", "high", "low", "close"}.issubset(first.keys()):
-        df = pd.DataFrame(klines)
-        if "turnover" not in df.columns and "turnoverUsd" in df.columns:
-            df = df.rename(columns={"turnoverUsd": "turnover"})
-    elif isinstance(first, dict) and {"openPrice", "highPrice", "lowPrice", "closePrice"}.issubset(first.keys()):
-        df = pd.DataFrame(klines).rename(columns={
-            "openPrice": "open", "highPrice": "high", "lowPrice": "low", "closePrice": "close"
-        })
-        if "turnover" not in df.columns and "turnoverUsd" in df.columns:
-            df = df.rename(columns={"turnoverUsd": "turnover"})
-    elif isinstance(first, (list, tuple)):
-        cols = ["start", "open", "high", "low", "close", "volume", "turnover"]
-        norm = []
-        for row in klines:
-            row = list(row)
-            if len(row) < 7:
-                row = row + [None] * (7 - len(row))
-            norm.append(row[:7])
-        df = pd.DataFrame(norm, columns=cols)
-    else:
-        return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume", "turnover"])
-    if "start" in df.columns:
-        df["start"] = pd.to_datetime(pd.to_numeric(df["start"], errors="coerce"), unit="ms", utc=True)
-    for col in ["open", "high", "low", "close", "volume", "turnover"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "start" in df.columns:
-        df = df.sort_values("start").reset_index(drop=True)
-    for col in ["start", "open", "high", "low", "close", "volume", "turnover"]:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df[["start", "open", "high", "low", "close", "volume", "turnover"]]
+
+    out = []
+    for row in klines:
+        # строка может прийти как список строк/чисел
+        open_time = int(row[0])  # ms
+        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+        v = float(row[5])
+        quote_vol = float(row[7])  # turnover
+        out.append([open_time, o, h, l, c, v, quote_vol])
+
+    df = pd.DataFrame(out, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
+    df["start"] = pd.to_datetime(df["start"], unit="ms", utc=True)
+    df = df.sort_values("start").reset_index(drop=True)
+    return df
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -231,8 +225,6 @@ def morning_star(df, i) -> bool:
 def evening_star(df, i) -> bool:
     if i < 2: return False
     c1 = is_bull(df, i-2)
-    small2 = abs(body(df, i-1)) < abs(body[df, i-2]) * 0.5 if False else abs(body(df, i-1)) < abs(body(df, i-2)) * 0.5
-    # (выше трюк для подсветки; фактически то же условие:)
     small2 = abs(body(df, i-1)) < abs(body(df, i-2)) * 0.5
     c3 = is_bear(df, i)
     cond3 = df.loc[i, "close"] <= (df.loc[i-2, "open"] + df.loc[i-2, "close"]) / 2
@@ -310,52 +302,70 @@ def append_log(row: dict):
     )
 
 # -------------------------
-# Клиент Bybit
+# Клиент Binance
 # -------------------------
 
-class BybitClient:
-    def __init__(self, max_retries=5, backoff=1.5):
-        self.client = HTTP(testnet=False)  # публичные kline ключей не требуют
+class BinanceClient:
+    def __init__(self, max_retries=5, backoff=1.5, rate_delay=RATE_DELAY_SEC):
+        self.base = BINANCE_FAPI_BASE
+        self.sess = requests.Session()
         self.max_retries = max_retries
         self.backoff = backoff
+        self.rate_delay = rate_delay
+        # Небольшие заголовки полезны для стабильности
+        self.sess.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "pattern-scanner/1.0"
+        })
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 500):
-        params = dict(category=CATEGORY, symbol=symbol, interval=interval, limit=min(limit, 1000))
+    def get_klines(self, symbol: str, interval_api: str, limit: int = 500):
+        """
+        interval_api должен быть одним из: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d ...
+        Мы подаём "1h/4h/1d".
+        """
+        params = {
+            "symbol": symbol,
+            "interval": interval_api,
+            "limit": min(limit, 1500),
+        }
+        url = f"{self.base}/fapi/v1/klines"
+
         retry = 0
         while True:
             try:
-                data = self.client.get_kline(**params)
-
-                # Проверка retCode/retMsg
-                if isinstance(data, dict) and data.get("retCode") not in (0, None):
-                    rc = data.get("retCode")
-                    msg = data.get("retMsg")
-                    raise RuntimeError(f"Bybit retCode={rc}, retMsg={msg}, params={params}")
-
-                lst = (data.get("result", {}) or {}).get("list", [])
-                if lst is None:
-                    lst = []
-                return list(lst)
-
+                time.sleep(self.rate_delay)
+                r = self.sess.get(url, params=params, timeout=30)
+                if r.status_code == 429:
+                    # rate limit — даём длиннее паузу
+                    retry += 1
+                    sleep_for = max(self.backoff ** retry, 5)
+                    print(f"[get_klines] {symbol} {interval_api} 429 rate-limit, sleep {sleep_for:.1f}s", flush=True)
+                    time.sleep(sleep_for)
+                    if retry > self.max_retries:
+                        r.raise_for_status()
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                if not isinstance(data, list):
+                    raise RuntimeError(f"Unexpected klines payload: type={type(data)}")
+                return data
             except Exception as e:
                 retry += 1
-                print(f"[get_klines] {symbol} {interval} attempt={retry} error={type(e).__name__}: {e}", flush=True)
-                if getattr(e, "args", None):
-                    msg0 = str(e.args[0])
-                    if len(msg0) < 1000:
-                        print(f"[get_klines] args0={msg0}", flush=True)
-            if retry > self.max_retries:
-                raise
-            time.sleep(self.backoff ** retry)
+                msg = f"{type(e).__name__}: {e}"
+                print(f"[get_klines] {symbol} {interval_api} attempt={retry} error={msg}", flush=True)
+                if retry > self.max_retries:
+                    raise
+                time.sleep(self.backoff ** retry)
 
 # -------------------------
 # Обработка symbol|TF: последняя ЗАКРЫТАЯ свеча
 # -------------------------
 
-def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_ts_ms: Optional[int]):
-    interval = TF_MAP[tf]
-    klines = client.get_klines(symbol, interval, limit=500)
+def process_symbol_tf(client: BinanceClient, symbol: str, tf: str, last_processed_ts_ms: Optional[int]):
+    interval_api = TF_MAP[tf]
+    klines = client.get_klines(symbol, interval_api, limit=500)
     df = to_df(klines)
+
     min_len = max(EMA_PERIOD + 5, ATR_PERIOD + 5, RVOL_LEN + 5, 60)
     if df.empty or len(df) < min_len:
         return {
@@ -399,8 +409,8 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
         "utc_start": ts_utc.isoformat(),
         "open": float(df.loc[i, "open"]),
         "high": float(df.loc[i, "high"]),
-        "low": float(df.loc[i, "low"]),
-        "close": float(df.loc[i, "close"]),
+        "low":  float(df.loc[i, "low"]),
+        "close":float(df.loc[i, "close"]),
         "volume": float(df.loc[i, "volume"]) if not pd.isna(df.loc[i, "volume"]) else float("nan"),
         "turnover": float(df.loc[i, "turnover"]) if not pd.isna(df.loc[i, "turnover"]) else float("nan"),
         "ema50": ema50_val,
@@ -408,7 +418,7 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
         "rvol20": rvol20_val,
     }
 
-    # 1) сначала — какие паттерны есть (без фильтров)
+    # 1) какие паттерны есть (без фильтров)
     cfg = STRATEGIES.get(symbol, {}).get(tf, [])
     expected_names = [p for (p, _, _, _) in cfg]
     matched = []
@@ -426,7 +436,7 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
             "already_logged": already_logged, "ts_ms": ts_ms
         }
 
-    # 2) если паттерны есть — проверяем фильтры
+    # 2) проверяем фильтры
     signals = []
     rejections = []
     rvol_thr = get_rvol_threshold(symbol, tf)
@@ -457,8 +467,8 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
             "side": side,
             "open": debug_row["open"],
             "high": debug_row["high"],
-            "low": debug_row["low"],
-            "close": debug_row["close"],
+            "low":  debug_row["low"],
+            "close":debug_row["close"],
             "confirm_level": float(confirm),
             "ema50": ema50_val,
             "atr14": atr14_val,
@@ -491,9 +501,8 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
 # -------------------------
 
 def print_start_banner():
-    print("Онлайн-сканер паттернов — старт")
+    print("Онлайн-сканер паттернов (Binance Futures) — старт")
     print(f"Сейчас (Берлин): {fmt_berlin(now_utc())}")
-    print(f"Категория: {CATEGORY}")
     print(f"Журнал: {LOG_FILE}")
     print(f"Кэш: {STATE_FILE}")
     print("Стартовый опрос последних закрытых свечей; далее — строго раз в час на начале часа.")
@@ -513,7 +522,7 @@ def print_cycle_header(cycle_idx: int, prefix: str = ""):
 # Один проход сканирования (с сортированным выводом)
 # -------------------------
 
-def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str = "") -> int:
+def run_scan_cycle(client: BinanceClient, state: dict, cycle_idx: int, prefix: str = "") -> int:
     print_cycle_header(cycle_idx, prefix)
 
     tasks = [(s, tf) for s in SYMBOLS for tf in TF_SORT if tf in STRATEGIES.get(s, {})]
@@ -571,7 +580,7 @@ def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str
 # -------------------------
 
 def main_loop():
-    client = BybitClient()
+    client = BinanceClient()
     state = load_state()
     # инициализация ключей состояния
     for s in SYMBOLS:
@@ -607,7 +616,7 @@ if __name__ == "__main__":
     parser.add_argument("--once", action="store_true", help="Выполнить один проход и выйти")
     args = parser.parse_args()
 
-    client = BybitClient()
+    client = BinanceClient()
     state = load_state()
     for s in SYMBOLS:
         for tf in STRATEGIES.get(s, {}).keys():
