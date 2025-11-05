@@ -1,5 +1,3 @@
-# -*- coding: cp1251 -*-
-
 # bybit_pattern_scanner_hourly_berlin.py
 # Python 3.10+
 # pip install pybit pandas numpy pytz
