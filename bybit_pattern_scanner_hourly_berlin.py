@@ -308,7 +308,7 @@ def append_log(row: dict):
 
 class BybitClient:
     def __init__(self, max_retries=5, backoff=1.5):
-        self.client = HTTP(testnet=False)
+        self.client = HTTP(testnet=False)  # публичные kline ключей не требуют
         self.max_retries = max_retries
         self.backoff = backoff
 
@@ -322,13 +322,19 @@ class BybitClient:
                 if lst is None:
                     lst = []
                 return list(lst)
-            except RequestException:
+            except Exception as e:
                 retry += 1
-            except Exception:
-                retry += 1
+                # ВАЖНО: покажем тип и текст исключения, а если есть ответ — тоже
+                print(f"[get_klines] {symbol} {interval} attempt={retry} error={type(e).__name__}: {e}", flush=True)
+                # Иногда pybit кладёт тело ответа в e.args[0]
+                if getattr(e, "args", None):
+                    msg0 = str(e.args[0])
+                    if len(msg0) < 500:
+                        print(f"[get_klines] args0={msg0}", flush=True)
             if retry > self.max_retries:
                 raise
             time.sleep(self.backoff ** retry)
+
 
 # -------------------------
 # Обработка symbol|TF: ВСЕГДА последняя ЗАКРЫТАЯ свеча
@@ -509,14 +515,19 @@ def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str
 
     results: Dict[Tuple[str, str], dict] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futmap = {ex.submit(process_symbol_tf, client, s, tf, state.get(f"{s}|{tf}")): (s, tf) for (s, tf) in tasks}
-        for fut in as_completed(futmap):
-            s, tf = futmap[fut]
-            try:
-                results[(s, tf)] = fut.result()
-            except Exception:
-                results[(s, tf)] = {"symbol": s, "tf": tf, "status": "ошибка запроса/обработки",
-                                    "reason": "exception", "debug": None, "signals": [], "already_logged": True}
+       futmap = {ex.submit(process_symbol_tf, client, s, tf, state.get(f"{s}|{tf}")): (s, tf) for (s, tf) in tasks}
+       for fut in as_completed(futmap):
+          s, tf = futmap[fut]
+          try:
+            results[(s, tf)] = fut.result()
+           except Exception as e:
+             results[(s, tf)] = {
+                "symbol": s, "tf": tf,
+                "status": "ошибка запроса/обработки",
+                "reason": f"{type(e).__name__}: {e}",
+                "debug": None, "signals": [], "already_logged": True
+             }
+
 
     found_cnt = 0
     # печатаем строго в отсортированном порядке
