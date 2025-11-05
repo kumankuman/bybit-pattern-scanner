@@ -2,7 +2,7 @@ name: Pattern Scanner
 
 on:
   schedule:
-    # Запуск каждый час в :02 (UTC) — берём закрытую свечу без гонок
+    # Запуск каждый час в :02 (UTC) — безопасно для закрытой свечи
     - cron: "2 * * * *"
   workflow_dispatch: {}   # ручной запуск из вкладки Actions
 
@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: pattern-scanner
-  cancel-in-progress: false
+  cancel-in-progress: true  # если предыдущий ран ещё идёт — отменяем его
 
 jobs:
   run:
@@ -38,6 +38,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Import sanity check (pybit)
+        run: |
+          python - << 'PY'
+          from pybit.unified_trading import HTTP
+          print("pybit import OK")
+          PY
+
+      - name: Sanity check Bybit public API
+        run: |
+          echo "GET /v5/market/kline BTCUSDT 60 (2 rows)"
+          curl -sS "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=2" | head -c 600 || true
+
       - name: Run scanner (single pass)
         env:
           RUN_ONCE: "1"
@@ -47,7 +59,7 @@ jobs:
         run: |
           python bybit_pattern_scanner_hourly_berlin.py --once
 
-      # Необязательно: создаём файлы, если их ещё нет
+      # Создадим файлы, если их ещё нет (чтобы шаг коммита не падал)
       - name: Ensure log files exist
         run: |
           [ -f signals_log.csv ] || echo "start_berlin,utc_start,symbol,tf,pattern,side,open,high,low,close,confirm_level,ema50,atr14,rvol20,tpR,kATR,ts_ms" > signals_log.csv
