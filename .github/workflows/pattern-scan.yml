@@ -1,0 +1,49 @@
+name: Pattern Scanner
+
+on:
+  schedule:
+    # Запуск каждый час в :02 (UTC). Сдвиг на 2 минуты после «ровного часа».
+    - cron: "2 * * * *"
+  workflow_dispatch: {}   # ручной запуск из вкладки Actions
+
+permissions:
+  contents: write   # нужно, чтобы коммитить лог/состояние обратно в репозиторий
+
+concurrency:
+  group: pattern-scanner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scanner (single pass)
+        env:
+          RUN_ONCE: "1"      # один проход
+          TZ: Europe/Berlin  # для формата времени в выводе
+        run: |
+          python bybit_pattern_scanner_hourly_berlin.py --once
+
+      - name: Commit updated logs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add signals_log.csv last_processed.json || true
+          git diff --staged --quiet || git commit -m "Update signals/state [skip ci]"
+          git push
