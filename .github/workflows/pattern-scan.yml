@@ -2,12 +2,12 @@ name: Pattern Scanner
 
 on:
   schedule:
-    # Запуск каждый час в :02 (UTC). Сдвиг на 2 минуты после «ровного часа».
+    # Запуск каждый час в :02 (UTC) — берём закрытую свечу без гонок
     - cron: "2 * * * *"
   workflow_dispatch: {}   # ручной запуск из вкладки Actions
 
 permissions:
-  contents: write   # нужно, чтобы коммитить лог/состояние обратно в репозиторий
+  contents: write         # нужно, чтобы коммитить изменения в репозиторий
 
 concurrency:
   group: pattern-scanner
@@ -23,6 +23,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: List repository files (debug)
+        run: |
+          pwd
+          ls -la
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -35,10 +40,18 @@ jobs:
 
       - name: Run scanner (single pass)
         env:
-          RUN_ONCE: "1"      # один проход
-          TZ: Europe/Berlin  # для формата времени в выводе
+          RUN_ONCE: "1"
+          TZ: Europe/Berlin
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           python bybit_pattern_scanner_hourly_berlin.py --once
+
+      # Необязательно: создаём файлы, если их ещё нет
+      - name: Ensure log files exist
+        run: |
+          [ -f signals_log.csv ] || echo "start_berlin,utc_start,symbol,tf,pattern,side,open,high,low,close,confirm_level,ema50,atr14,rvol20,tpR,kATR,ts_ms" > signals_log.csv
+          [ -f last_processed.json ] || echo "{}" > last_processed.json
 
       - name: Commit updated logs
         run: |
