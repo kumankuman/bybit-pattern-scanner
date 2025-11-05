@@ -1,9 +1,10 @@
+# -*- coding: utf-8 -*-
 # bybit_pattern_scanner_hourly_berlin.py
 # Python 3.10+
-# pip install pybit pandas numpy pytz
+# pip install -r requirements.txt
 # Поведение:
 # - При первом запуске: стартовый опрос ПОСЛЕДНИХ ЗАКРЫТЫХ свечей (1H/4H/1D).
-# - Далее: раз в ЧАС на начале часа.
+# - Далее: раз в ЧАС на начале часа (в обычном режиме).
 # - Время в выводе/логе — Europe/Berlin.
 # - Для КАЖДОГО symbol|TF анализируем ПОСЛЕДНЮЮ ЗАКРЫТУЮ свечу:
 #   1) Сначала определяем, есть ли паттерн(ы).
@@ -22,7 +23,7 @@ import time
 import numpy as np
 import pandas as pd
 from pybit.unified_trading import HTTP
-from requests.exceptions import RequestException
+from requests.exceptions import RequestException  # оставлено на случай расширений
 import pytz
 
 # -------------------------
@@ -30,8 +31,10 @@ import pytz
 # -------------------------
 
 CATEGORY = "linear"
-SYMBOLS = ["ADAUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
-           "ETHUSDT", "LTCUSDT", "POLUSDT", "SOLUSDT", "XRPUSDT"]  # алфавит
+SYMBOLS = [
+    "ADAUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
+    "ETHUSDT", "LTCUSDT", "POLUSDT", "SOLUSDT", "XRPUSDT"
+]  # алфавит
 
 TF_MAP = {"1H": "60", "4H": "240", "1D": "D"}
 TF_SORT = ["1H", "4H", "1D"]
@@ -69,7 +72,7 @@ STRATEGIES: Dict[str, Dict[str, List[Tuple[str, str, float, float]]]] = {
 # Фильтры
 EMA_PERIOD = 50
 ATR_PERIOD = 14
-ATR_MULT_LIMIT = 2.0  # ATR <= 2? медианы
+ATR_MULT_LIMIT = 2.0  # ATR <= 2 × медианы
 RVOL_LEN = 20
 RVOL_MIN = {"default": 1.2, ("LTCUSDT", "1H"): 1.2, ("BTCUSDT", "1H"): 1.2, ("POLUSDT", "1D"): 1.2}
 
@@ -123,40 +126,40 @@ def sleep_until_next_top_of_hour():
 
 def to_df(klines) -> pd.DataFrame:
     if not klines:
-        return pd.DataFrame(columns=["start","open","high","low","close","volume","turnover"])
+        return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume", "turnover"])
     first = klines[0]
-    if isinstance(first, dict) and {"open","high","low","close"}.issubset(first.keys()):
+    if isinstance(first, dict) and {"open", "high", "low", "close"}.issubset(first.keys()):
         df = pd.DataFrame(klines)
         if "turnover" not in df.columns and "turnoverUsd" in df.columns:
             df = df.rename(columns={"turnoverUsd": "turnover"})
-    elif isinstance(first, dict) and {"openPrice","highPrice","lowPrice","closePrice"}.issubset(first.keys()):
+    elif isinstance(first, dict) and {"openPrice", "highPrice", "lowPrice", "closePrice"}.issubset(first.keys()):
         df = pd.DataFrame(klines).rename(columns={
             "openPrice": "open", "highPrice": "high", "lowPrice": "low", "closePrice": "close"
         })
         if "turnover" not in df.columns and "turnoverUsd" in df.columns:
             df = df.rename(columns={"turnoverUsd": "turnover"})
     elif isinstance(first, (list, tuple)):
-        cols = ["start","open","high","low","close","volume","turnover"]
+        cols = ["start", "open", "high", "low", "close", "volume", "turnover"]
         norm = []
         for row in klines:
             row = list(row)
             if len(row) < 7:
-                row = row + [None]*(7 - len(row))
+                row = row + [None] * (7 - len(row))
             norm.append(row[:7])
         df = pd.DataFrame(norm, columns=cols)
     else:
-        return pd.DataFrame(columns=["start","open","high","low","close","volume","turnover"])
+        return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume", "turnover"])
     if "start" in df.columns:
         df["start"] = pd.to_datetime(pd.to_numeric(df["start"], errors="coerce"), unit="ms", utc=True)
-    for col in ["open","high","low","close","volume","turnover"]:
+    for col in ["open", "high", "low", "close", "volume", "turnover"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "start" in df.columns:
         df = df.sort_values("start").reset_index(drop=True)
-    for col in ["start","open","high","low","close","volume","turnover"]:
+    for col in ["start", "open", "high", "low", "close", "volume", "turnover"]:
         if col not in df.columns:
             df[col] = np.nan
-    return df[["start","open","high","low","close","volume","turnover"]]
+    return df[["start", "open", "high", "low", "close", "volume", "turnover"]]
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -202,25 +205,25 @@ def bearish_engulfing(df, i) -> bool:
             and df.loc[i, "open"] >= df.loc[i-1, "close"])
 
 def hammer(df, i) -> bool:
-    o, h, l, c = df.loc[i, ["open","high","low","close"]]
+    o, h, l, c = df.loc[i, ["open", "high", "low", "close"]]
     real_body = abs(c - o)
     if (h - l) == 0: return False
     lower_shadow = min(o, c) - l
     upper_shadow = h - max(o, c)
-    return (real_body > 0 and lower_shadow >= 2*real_body and upper_shadow <= real_body)
+    return (real_body > 0 and lower_shadow >= 2 * real_body and upper_shadow <= real_body)
 
 def shooting_star(df, i) -> bool:
-    o, h, l, c = df.loc[i, ["open","high","low","close"]]
+    o, h, l, c = df.loc[i, ["open", "high", "low", "close"]]
     real_body = abs(c - o)
     if (h - l) == 0: return False
     upper_shadow = h - max(o, c)
     lower_shadow = min(o, c) - l
-    return (real_body > 0 and upper_shadow >= 2*real_body and lower_shadow <= real_body)
+    return (real_body > 0 and upper_shadow >= 2 * real_body and lower_shadow <= real_body)
 
 def morning_star(df, i) -> bool:
     if i < 2: return False
     c1 = is_bear(df, i-2)
-    small2 = abs(body(df, i-1)) < abs(body(df, i-2))*0.5
+    small2 = abs(body(df, i-1)) < abs(body(df, i-2)) * 0.5
     c3 = is_bull(df, i)
     cond3 = df.loc[i, "close"] >= (df.loc[i-2, "open"] + df.loc[i-2, "close"]) / 2
     return c1 and small2 and c3 and cond3
@@ -228,7 +231,9 @@ def morning_star(df, i) -> bool:
 def evening_star(df, i) -> bool:
     if i < 2: return False
     c1 = is_bull(df, i-2)
-    small2 = abs(body(df, i-1)) < abs(body(df, i-2))*0.5
+    small2 = abs(body(df, i-1)) < abs(body[df, i-2]) * 0.5 if False else abs(body(df, i-1)) < abs(body(df, i-2)) * 0.5
+    # (выше трюк для подсветки; фактически то же условие:)
+    small2 = abs(body(df, i-1)) < abs(body(df, i-2)) * 0.5
     c3 = is_bear(df, i)
     cond3 = df.loc[i, "close"] <= (df.loc[i-2, "open"] + df.loc[i-2, "close"]) / 2
     return c1 and small2 and c3 and cond3
@@ -300,7 +305,9 @@ def save_state(state: dict):
 
 def append_log(row: dict):
     file_exists = os.path.exists(LOG_FILE)
-    pd.DataFrame([row]).to_csv(LOG_FILE, mode="a", header=not file_exists, index=False, encoding="utf-8")
+    pd.DataFrame([row]).to_csv(
+        LOG_FILE, mode="a", header=not file_exists, index=False, encoding="utf-8"
+    )
 
 # -------------------------
 # Клиент Bybit
@@ -318,26 +325,31 @@ class BybitClient:
         while True:
             try:
                 data = self.client.get_kline(**params)
-                lst = data.get("result", {}).get("list", [])
+
+                # Проверка retCode/retMsg
+                if isinstance(data, dict) and data.get("retCode") not in (0, None):
+                    rc = data.get("retCode")
+                    msg = data.get("retMsg")
+                    raise RuntimeError(f"Bybit retCode={rc}, retMsg={msg}, params={params}")
+
+                lst = (data.get("result", {}) or {}).get("list", [])
                 if lst is None:
                     lst = []
                 return list(lst)
+
             except Exception as e:
                 retry += 1
-                # ВАЖНО: покажем тип и текст исключения, а если есть ответ — тоже
                 print(f"[get_klines] {symbol} {interval} attempt={retry} error={type(e).__name__}: {e}", flush=True)
-                # Иногда pybit кладёт тело ответа в e.args[0]
                 if getattr(e, "args", None):
                     msg0 = str(e.args[0])
-                    if len(msg0) < 500:
+                    if len(msg0) < 1000:
                         print(f"[get_klines] args0={msg0}", flush=True)
             if retry > self.max_retries:
                 raise
             time.sleep(self.backoff ** retry)
 
-
 # -------------------------
-# Обработка symbol|TF: ВСЕГДА последняя ЗАКРЫТАЯ свеча
+# Обработка symbol|TF: последняя ЗАКРЫТАЯ свеча
 # -------------------------
 
 def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_ts_ms: Optional[int]):
@@ -387,8 +399,8 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
         "utc_start": ts_utc.isoformat(),
         "open": float(df.loc[i, "open"]),
         "high": float(df.loc[i, "high"]),
-        "low":  float(df.loc[i, "low"]),
-        "close":float(df.loc[i, "close"]),
+        "low": float(df.loc[i, "low"]),
+        "close": float(df.loc[i, "close"]),
         "volume": float(df.loc[i, "volume"]) if not pd.isna(df.loc[i, "volume"]) else float("nan"),
         "turnover": float(df.loc[i, "turnover"]) if not pd.isna(df.loc[i, "turnover"]) else float("nan"),
         "ema50": ema50_val,
@@ -396,7 +408,7 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
         "rvol20": rvol20_val,
     }
 
-    # 1) СНАЧАЛА — выявляем какие паттерны на свече есть (без фильтров)
+    # 1) сначала — какие паттерны есть (без фильтров)
     cfg = STRATEGIES.get(symbol, {}).get(tf, [])
     expected_names = [p for (p, _, _, _) in cfg]
     matched = []
@@ -414,25 +426,20 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
             "already_logged": already_logged, "ts_ms": ts_ms
         }
 
-    # 2) Если паттерны есть — проверяем фильтры ПОКАЖЕМ причины отдельно для каждого паттерна
+    # 2) если паттерны есть — проверяем фильтры
     signals = []
-    rejections = []  # список строк-пояснений по отклонённым паттернам
+    rejections = []
     rvol_thr = get_rvol_threshold(symbol, tf)
     session_ok_flag = session_ok(symbol, tf, ts_utc)
     atr_ok_flag = atr_ok(df, i)
-    # trend и confirm считаются per-pattern (зависят от side)
     for (pname, side, tpR, kATR) in matched:
         reasons = []
-        # session
         if not session_ok_flag:
             reasons.append("session")
-        # ATR
         if not atr_ok_flag:
             reasons.append("ATR")
-        # RVOL
         if not rvol_ok(df, i, rvol_thr):
             reasons.append(f"RVOL<thr({rvol_thr})")
-        # TREND
         if not trend_ok(df, i, side):
             reasons.append("trend")
 
@@ -440,7 +447,6 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
             rejections.append(f"{pname} {side}: отклонён — " + ", ".join(reasons))
             continue
 
-        # всё прошло — сигнал
         confirm = confirmation_level(df, i, side)
         row = {
             "start_berlin": debug_row["start_berlin"],
@@ -451,8 +457,8 @@ def process_symbol_tf(client: BybitClient, symbol: str, tf: str, last_processed_
             "side": side,
             "open": debug_row["open"],
             "high": debug_row["high"],
-            "low":  debug_row["low"],
-            "close":debug_row["close"],
+            "low": debug_row["low"],
+            "close": debug_row["close"],
             "confirm_level": float(confirm),
             "ema50": ema50_val,
             "atr14": atr14_val,
@@ -510,27 +516,27 @@ def print_cycle_header(cycle_idx: int, prefix: str = ""):
 def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str = "") -> int:
     print_cycle_header(cycle_idx, prefix)
 
-    # сформируем задачи в нужном порядке
     tasks = [(s, tf) for s in SYMBOLS for tf in TF_SORT if tf in STRATEGIES.get(s, {})]
 
     results: Dict[Tuple[str, str], dict] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-       futmap = {ex.submit(process_symbol_tf, client, s, tf, state.get(f"{s}|{tf}")): (s, tf) for (s, tf) in tasks}
-       for fut in as_completed(futmap):
-          s, tf = futmap[fut]
-          try:
-            results[(s, tf)] = fut.result()
-           except Exception as e:
-             results[(s, tf)] = {
-                "symbol": s, "tf": tf,
-                "status": "ошибка запроса/обработки",
-                "reason": f"{type(e).__name__}: {e}",
-                "debug": None, "signals": [], "already_logged": True
-             }
-
+        futmap = {
+            ex.submit(process_symbol_tf, client, s, tf, state.get(f"{s}|{tf}")): (s, tf)
+            for (s, tf) in tasks
+        }
+        for fut in as_completed(futmap):
+            s, tf = futmap[fut]
+            try:
+                results[(s, tf)] = fut.result()
+            except Exception as e:
+                results[(s, tf)] = {
+                    "symbol": s, "tf": tf,
+                    "status": "ошибка запроса/обработки",
+                    "reason": f"{type(e).__name__}: {e}",
+                    "debug": None, "signals": [], "already_logged": True
+                }
 
     found_cnt = 0
-    # печатаем строго в отсортированном порядке
     for (s, tf) in tasks:
         res = results[(s, tf)]
         status = res["status"]
@@ -540,18 +546,9 @@ def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str
         already_logged = res.get("already_logged", True)
         ts_ms = res.get("ts_ms", None)
 
-        # заголовок для symbol|TF
         print(f"  {s} {tf}: {status}")
         print(f"    причина: {reason}")
 
-        # если сигналов нет — всё равно выводим отладочную свечу
-        # if dbg:
-        #     print(f"    свеча {s} {tf} @ {dbg['start_berlin']} (закрытие {dbg['close_berlin']}): "
-        #           f"O={dbg['open']:.8f} H={dbg['high']:.8f} L={dbg['low']:.8f} C={dbg['close']:.8f} "
-        #           f"Vol={dbg['volume']:.4f} Turnover={dbg['turnover']:.4f} "
-        #           f"EMA50={dbg['ema50']:.8f} ATR14={dbg['atr14']:.8f} RVOL20={dbg['rvol20']:.2f}")
-
-        # печатаем сигналы и логируем только если свеча новая
         if sigs:
             for row in sigs:
                 found_cnt += 1
@@ -561,12 +558,10 @@ def run_scan_cycle(client: BybitClient, state: dict, cycle_idx: int, prefix: str
                     f"EMA50={row['ema50']:.8f} ATR14={row['atr14']:.8f} RVOL20={row['rvol20']:.2f} "
                     f"TP={row['tpR']}R k={row['kATR']} ({row['start_berlin']})"
                 )
-            # логируем только если свеча НЕ была обработана ранее
             key = f"{s}|{tf}"
             if ts_ms is not None and not already_logged:
                 for row in sigs:
                     append_log(row)
-                # обновим состояние для этой пары/TF
                 state[key] = ts_ms
 
     return found_cnt
@@ -602,6 +597,10 @@ def main_loop():
         print(f"Итого по циклу: новых сигналов — {found_cnt}. Следующая проверка на начале следующего часа.")
         sleep_until_next_top_of_hour()
 
+# -------------------------
+# Точка входа (режимы: обычный / --once)
+# -------------------------
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -610,7 +609,6 @@ if __name__ == "__main__":
 
     client = BybitClient()
     state = load_state()
-    # инициализация ключей состояния
     for s in SYMBOLS:
         for tf in STRATEGIES.get(s, {}).keys():
             state.setdefault(f"{s}|{tf}", None)
@@ -619,12 +617,10 @@ if __name__ == "__main__":
     print_start_banner()
 
     if args.once or os.getenv("RUN_ONCE") == "1":
-        # Один скан-цикл и выход
         found_cnt = run_scan_cycle(client, state, cycle_idx=0, prefix="Запуск по расписанию")
         save_state(state)
         print(f"Итого по циклу: новых сигналов — {found_cnt}. Завершение.")
     else:
-        # Обычный бесконечный режим
         found_first = run_scan_cycle(client, state, cycle_idx=0, prefix="Стартовый")
         save_state(state)
         print(f"Итого по стартовому циклу: новых сигналов — {found_first}.")
@@ -636,5 +632,3 @@ if __name__ == "__main__":
             save_state(state)
             print(f"Итого по циклу: новых сигналов — {found_cnt}. Следующая проверка на начале следующего часа.")
             sleep_until_next_top_of_hour()
-
-
