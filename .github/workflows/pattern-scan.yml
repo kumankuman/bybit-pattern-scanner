@@ -38,13 +38,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Import sanity check (pybit)
-        run: |
-          python - << 'PY'
-          from pybit.unified_trading import HTTP
-          print("pybit import OK")
-          PY
-
       - name: Sanity check Bybit public API
         run: |
           echo "GET /v5/market/kline BTCUSDT 60 (2 rows)"
