@@ -1,24 +1,22 @@
 # -*- coding: utf-8 -*-
-# bybit_pattern_scanner_hourly_berlin.py  → теперь под Binance Futures (USDⓢ-M)
+# pattern_scanner_binance_spot.py  — сканер паттернов по Binance Spot
 # Python 3.10+
-# pip install -r requirements.txt
+# Требуется: pandas==2.2.3, numpy==1.26.4, pytz==2024.1, requests==2.32.3
 #
 # Поведение:
 # - При первом запуске: стартовый опрос ПОСЛЕДНИХ ЗАКРЫТЫХ свечей (1H/4H/1D).
 # - Далее: раз в ЧАС на начале часа (в обычном режиме).
 # - Время в выводе/логе — Europe/Berlin.
 # - Для КАЖДОГО symbol|TF анализируем ПОСЛЕДНЮЮ ЗАКРЫТУЮ свечу:
-#   1) Сначала определяем, есть ли паттерн(ы).
+#   1) Определяем, есть ли паттерн(ы).
 #   2) Если есть — проверяем фильтры и показываем причины отклонения или СИГНАЛ.
 #   3) Если нет — пишем "нет паттернов: [ожидаемые]".
 # - Сигналы пишутся в signals_log.csv ТОЛЬКО если эта свеча ещё не логировалась.
 # - Вывод отсортирован: символы по алфавиту, TF — 1H, 4H, 1D.
 #
-# Требуемые пакеты:
-#   pandas==2.2.3
-#   numpy==1.26.4
-#   pytz==2024.1
-#   requests==2.32.3
+# Запуск:
+#   python pattern_scanner_binance_spot.py --once      # один проход и выход
+#   python pattern_scanner_binance_spot.py             # бесконечный режим (каждый час)
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -36,18 +34,16 @@ import requests
 # Конфигурация
 # -------------------------
 
-# Биржа: Binance Futures USDⓢ-M (публичные свечи, без ключей)
-BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BINANCE_SPOT_BASE = "https://api.binance.com"  # только Spot
 
-# Список символов (Futures USDⓢ-M). POLUSDT — актуальное имя MATIC на Binance.
+# Список символов Spot (тикеры те же)
 SYMBOLS = [
     "ADAUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
     "ETHUSDT", "LTCUSDT", "POLUSDT", "SOLUSDT", "XRPUSDT"
 ]  # алфавит
 
-# TF-карты: логика сканера в "1H/4H/1D", у Binance — "1h/4h/1d"
+# TF-карты: сканер оперирует "1H/4H/1D", у Binance Spot — "1h/4h/1d"
 TF_MAP = {"1H": "1h", "4H": "4h", "1D": "1d"}
-# Для внутренней проверки закрытости свечи
 TF_DELTA = {"1H": timedelta(hours=1), "4H": timedelta(hours=4), "1D": timedelta(days=1)}
 TF_SORT = ["1H", "4H", "1D"]
 
@@ -95,11 +91,11 @@ AVOID_UTC_HOURS = {("LTCUSDT", "1H"): set(range(0, 6))}
 LOG_FILE = "signals_log.csv"
 STATE_FILE = "last_processed.json"
 
-# Пул потоков и щадящий темп (можно править через ENV в Actions)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # на Binance можно чуть больше параллельности
+# Пул потоков и темп запросов (можно переопределить ENV: MAX_WORKERS, RATE_DELAY_SEC)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 RATE_DELAY_SEC = float(os.getenv("RATE_DELAY_SEC", "0.1"))
 
-# Временные зоны
+# Временная зона
 BERLIN = pytz.timezone("Europe/Berlin")
 
 # -------------------------
@@ -133,21 +129,20 @@ def sleep_until_next_top_of_hour():
 
 def to_df(klines) -> pd.DataFrame:
     """
-    Поддержка формата Binance /fapi/v1/klines:
+    Binance Spot /api/v3/klines формат:
       [ openTime, open, high, low, close, volume, closeTime,
         quoteAssetVolume, numberOfTrades, takerBuyBase, takerBuyQuote, ignore ]
-    Мы приводим к колонкам: start, open, high, low, close, volume, turnover
+    Приводим к: start, open, high, low, close, volume, turnover
     """
     if not klines:
         return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume", "turnover"])
 
     out = []
     for row in klines:
-        # строка может прийти как список строк/чисел
         open_time = int(row[0])  # ms
         o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
         v = float(row[5])
-        quote_vol = float(row[7])  # turnover
+        quote_vol = float(row[7])  # оборот в котируемой валюте
         out.append([open_time, o, h, l, c, v, quote_vol])
 
     df = pd.DataFrame(out, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
@@ -302,44 +297,38 @@ def append_log(row: dict):
     )
 
 # -------------------------
-# Клиент Binance
+# Клиент Binance Spot
 # -------------------------
 
-class BinanceClient:
+class BinanceSpotClient:
     def __init__(self, max_retries=5, backoff=1.5, rate_delay=RATE_DELAY_SEC):
-        self.base = BINANCE_FAPI_BASE
+        self.base = BINANCE_SPOT_BASE
         self.sess = requests.Session()
         self.max_retries = max_retries
         self.backoff = backoff
         self.rate_delay = rate_delay
-        # Небольшие заголовки полезны для стабильности
         self.sess.headers.update({
             "Accept": "application/json",
-            "User-Agent": "pattern-scanner/1.0"
+            "User-Agent": "pattern-scanner/spot/1.0"
         })
 
     def get_klines(self, symbol: str, interval_api: str, limit: int = 500):
         """
-        interval_api должен быть одним из: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d ...
-        Мы подаём "1h/4h/1d".
+        Spot /api/v3/klines
+        interval_api: "1h" / "4h" / "1d"
         """
-        params = {
-            "symbol": symbol,
-            "interval": interval_api,
-            "limit": min(limit, 1500),
-        }
-        url = f"{self.base}/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": interval_api, "limit": min(limit, 1500)}
+        url = f"{self.base}/api/v3/klines"
 
         retry = 0
         while True:
             try:
                 time.sleep(self.rate_delay)
                 r = self.sess.get(url, params=params, timeout=30)
-                if r.status_code == 429:
-                    # rate limit — даём длиннее паузу
+                if r.status_code in (429, 418):
                     retry += 1
                     sleep_for = max(self.backoff ** retry, 5)
-                    print(f"[get_klines] {symbol} {interval_api} 429 rate-limit, sleep {sleep_for:.1f}s", flush=True)
+                    print(f"[get_klines] {symbol} {interval_api} spot {r.status_code} rate-limit, sleep {sleep_for:.1f}s", flush=True)
                     time.sleep(sleep_for)
                     if retry > self.max_retries:
                         r.raise_for_status()
@@ -361,7 +350,7 @@ class BinanceClient:
 # Обработка symbol|TF: последняя ЗАКРЫТАЯ свеча
 # -------------------------
 
-def process_symbol_tf(client: BinanceClient, symbol: str, tf: str, last_processed_ts_ms: Optional[int]):
+def process_symbol_tf(client: BinanceSpotClient, symbol: str, tf: str, last_processed_ts_ms: Optional[int]):
     interval_api = TF_MAP[tf]
     klines = client.get_klines(symbol, interval_api, limit=500)
     df = to_df(klines)
@@ -501,7 +490,7 @@ def process_symbol_tf(client: BinanceClient, symbol: str, tf: str, last_processe
 # -------------------------
 
 def print_start_banner():
-    print("Онлайн-сканер паттернов (Binance Futures) — старт")
+    print("Онлайн-сканер паттернов (Binance Spot) — старт")
     print(f"Сейчас (Берлин): {fmt_berlin(now_utc())}")
     print(f"Журнал: {LOG_FILE}")
     print(f"Кэш: {STATE_FILE}")
@@ -522,7 +511,7 @@ def print_cycle_header(cycle_idx: int, prefix: str = ""):
 # Один проход сканирования (с сортированным выводом)
 # -------------------------
 
-def run_scan_cycle(client: BinanceClient, state: dict, cycle_idx: int, prefix: str = "") -> int:
+def run_scan_cycle(client: BinanceSpotClient, state: dict, cycle_idx: int, prefix: str = "") -> int:
     print_cycle_header(cycle_idx, prefix)
 
     tasks = [(s, tf) for s in SYMBOLS for tf in TF_SORT if tf in STRATEGIES.get(s, {})]
@@ -550,7 +539,6 @@ def run_scan_cycle(client: BinanceClient, state: dict, cycle_idx: int, prefix: s
         res = results[(s, tf)]
         status = res["status"]
         reason = res["reason"]
-        dbg = res["debug"]
         sigs = res["signals"]
         already_logged = res.get("already_logged", True)
         ts_ms = res.get("ts_ms", None)
@@ -580,9 +568,8 @@ def run_scan_cycle(client: BinanceClient, state: dict, cycle_idx: int, prefix: s
 # -------------------------
 
 def main_loop():
-    client = BinanceClient()
+    client = BinanceSpotClient()
     state = load_state()
-    # инициализация ключей состояния
     for s in SYMBOLS:
         for tf in STRATEGIES.get(s, {}).keys():
             state.setdefault(f"{s}|{tf}", None)
@@ -590,12 +577,10 @@ def main_loop():
 
     print_start_banner()
 
-    # стартовый опрос последних закрытых свечей
     found_first = run_scan_cycle(client, state, cycle_idx=0, prefix="Стартовый")
     save_state(state)
     print(f"Итого по стартовому циклу: новых сигналов — {found_first}.")
 
-    # далее — строго по началу часа
     sleep_until_next_top_of_hour()
 
     cycle_idx = 0
@@ -607,7 +592,7 @@ def main_loop():
         sleep_until_next_top_of_hour()
 
 # -------------------------
-# Точка входа (режимы: обычный / --once)
+# Точка входа
 # -------------------------
 
 if __name__ == "__main__":
@@ -616,7 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("--once", action="store_true", help="Выполнить один проход и выйти")
     args = parser.parse_args()
 
-    client = BinanceClient()
+    client = BinanceSpotClient()
     state = load_state()
     for s in SYMBOLS:
         for tf in STRATEGIES.get(s, {}).keys():
